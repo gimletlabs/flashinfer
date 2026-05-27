@@ -712,8 +712,8 @@ __global__ void SamplingFromLogitsKernel(DType* logits, IdType* output, IdType* 
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
 
   // Resolve seed/offset from tensor or scalar
-  uint64_t philox_seed = seed_arr ? seed_arr[0] : seed_val;
-  uint64_t philox_offset = offset_arr ? offset_arr[0] : offset_val;
+  uint64_t philox_seed = seed_arr ? seed_arr[bx] : seed_val;
+  uint64_t philox_offset = offset_arr ? offset_arr[bx] : offset_val;
 
   const uint32_t row_idx = indices == nullptr ? bx : indices[bx];
   using SharedMem = typename BlockReduce<DataAndIndex<DType, IdType>, BLOCK_THREADS,
@@ -760,8 +760,8 @@ __global__ void SamplingFromProbKernel(DType* probs, IdType* output, IdType* ind
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
 
   // Resolve seed/offset from tensor or scalar
-  uint64_t philox_seed = seed_arr ? seed_arr[0] : seed_val;
-  uint64_t philox_offset = offset_arr ? offset_arr[0] : offset_val;
+  uint64_t philox_seed = seed_arr ? seed_arr[bx] : seed_val;
+  uint64_t philox_offset = offset_arr ? offset_arr[bx] : offset_val;
 
   curand_init(philox_seed, bx, philox_offset, &state);
   const uint32_t row_idx = indices == nullptr ? bx : indices[bx];
@@ -814,8 +814,8 @@ __global__ void TopKSamplingFromProbKernel(DType* probs, IdType* output, IdType*
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
 
   // Resolve seed/offset from tensor or scalar
-  uint64_t philox_seed = seed_arr ? seed_arr[0] : seed_val;
-  uint64_t philox_offset = offset_arr ? offset_arr[0] : offset_val;
+  uint64_t philox_seed = seed_arr ? seed_arr[bx] : seed_val;
+  uint64_t philox_offset = offset_arr ? offset_arr[bx] : offset_val;
 
   curandStatePhilox4_32_10_t state;
   curand_init(philox_seed, bx, philox_offset, &state);
@@ -937,8 +937,8 @@ __global__ void TopPSamplingFromProbKernel(DType* probs, IdType* output, IdType*
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
 
   // Resolve seed/offset from tensor or scalar
-  uint64_t philox_seed = seed_arr ? seed_arr[0] : seed_val;
-  uint64_t philox_offset = offset_arr ? offset_arr[0] : offset_val;
+  uint64_t philox_seed = seed_arr ? seed_arr[bx] : seed_val;
+  uint64_t philox_offset = offset_arr ? offset_arr[bx] : offset_val;
 
   curandStatePhilox4_32_10_t state;
   curand_init(philox_seed, bx, philox_offset, &state);
@@ -1053,8 +1053,8 @@ __global__ void MinPSamplingFromProbKernel(DType* probs, float* min_p_arr, IdTyp
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
 
   // Resolve seed/offset from tensor or scalar
-  uint64_t philox_seed = seed_arr ? seed_arr[0] : seed_val;
-  uint64_t philox_offset = offset_arr ? offset_arr[0] : offset_val;
+  uint64_t philox_seed = seed_arr ? seed_arr[bx] : seed_val;
+  uint64_t philox_offset = offset_arr ? offset_arr[bx] : offset_val;
 
   float p = (min_p_arr == nullptr) ? min_p_val : min_p_arr[bx];
   curandStatePhilox4_32_10_t state;
@@ -1141,8 +1141,8 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs, IdType* top_k_arr, 
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
 
   // Resolve seed/offset from tensor or scalar
-  uint64_t philox_seed = seed_arr ? seed_arr[0] : seed_val;
-  uint64_t philox_offset = offset_arr ? offset_arr[0] : offset_val;
+  uint64_t philox_seed = seed_arr ? seed_arr[bx] : seed_val;
+  uint64_t philox_offset = offset_arr ? offset_arr[bx] : offset_val;
 
   curandStatePhilox4_32_10_t state;
   curand_init(philox_seed, bx, philox_offset, &state);
@@ -1795,8 +1795,8 @@ __global__ void ChainSpeculativeSampling(DType* draft_probs, IdType* draft_token
   const uint32_t row_idx = bx;
 
   // Resolve seed/offset from tensor or scalar
-  uint64_t philox_seed = seed_arr ? seed_arr[0] : seed_val;
-  uint64_t philox_offset = offset_arr ? offset_arr[0] : offset_val;
+  uint64_t philox_seed = seed_arr ? seed_arr[bx] : seed_val;
+  uint64_t philox_offset = offset_arr ? offset_arr[bx] : offset_val;
 
   curandStatePhilox4_32_10_t curand_state;
   curand_init(philox_seed, bx, philox_offset, &curand_state);

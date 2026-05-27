@@ -646,6 +646,14 @@ def _validate_and_convert_seed_offset(
         if maybe_offset_arr.size(0) not in [1, batch_size]:
             raise ValueError(f"offset tensor length must be 1 or {batch_size}")
 
+    # Sampling kernels index seed/offset arrays per batch element (seed_arr[bx]),
+    # so a length-1 tensor must be broadcast to a full-length contiguous array
+    # to keep the legal size-1 input working without out-of-bounds reads.
+    if maybe_seed_arr is not None and maybe_seed_arr.size(0) == 1 and batch_size > 1:
+        maybe_seed_arr = maybe_seed_arr.expand(batch_size).contiguous()
+    if maybe_offset_arr is not None and maybe_offset_arr.size(0) == 1 and batch_size > 1:
+        maybe_offset_arr = maybe_offset_arr.expand(batch_size).contiguous()
+
     return maybe_seed_arr, seed_val, maybe_offset_arr, offset_val
 
 
