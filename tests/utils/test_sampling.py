@@ -289,6 +289,63 @@ def test_top_k_sampling_with_variable_k(batch_size, vocab_size, k):
         ]
 
 
+def _top_k_zero_test_inputs():
+    probs = torch.tensor(
+        [
+            [0.30, 0.20, 0.15, 0.12, 0.10, 0.06, 0.04, 0.03],
+            [0.01, 0.02, 0.03, 0.04, 0.05, 0.80, 0.03, 0.02],
+            [0.05, 0.10, 0.20, 0.25, 0.15, 0.10, 0.08, 0.07],
+            [0.08, 0.12, 0.18, 0.22, 0.16, 0.10, 0.08, 0.06],
+        ],
+        device="cuda:0",
+    )
+    top_k = torch.tensor([0, 1, 0, 3], dtype=torch.int32, device="cuda:0")
+    normalized_top_k = top_k.clone()
+    normalized_top_k[top_k == 0] = probs.shape[1]
+    return probs, top_k, normalized_top_k
+
+
+def test_top_k_sampling_zero_disables_filtering():
+    probs, top_k, normalized_top_k = _top_k_zero_test_inputs()
+    generator = torch.Generator(device="cuda:0").manual_seed(42)
+    reference_generator = torch.Generator(device="cuda:0").manual_seed(42)
+
+    samples = flashinfer.sampling.top_k_sampling_from_probs(
+        probs, top_k, generator=generator
+    )
+    reference_samples = flashinfer.sampling.top_k_sampling_from_probs(
+        probs, normalized_top_k, generator=reference_generator
+    )
+
+    torch.testing.assert_close(samples, reference_samples, rtol=0, atol=0)
+    assert samples[1].item() == probs[1].argmax().item()
+
+
+def test_joint_top_k_top_p_sampling_zero_disables_top_k_filtering():
+    probs, top_k, normalized_top_k = _top_k_zero_test_inputs()
+    top_p = torch.ones(probs.shape[0], device="cuda:0")
+    generator = torch.Generator(device="cuda:0").manual_seed(42)
+    reference_generator = torch.Generator(device="cuda:0").manual_seed(42)
+
+    samples = flashinfer.sampling.top_k_top_p_sampling_from_probs(
+        probs,
+        top_k,
+        top_p,
+        filter_apply_order="joint",
+        generator=generator,
+    )
+    reference_samples = flashinfer.sampling.top_k_top_p_sampling_from_probs(
+        probs,
+        normalized_top_k,
+        top_p,
+        filter_apply_order="joint",
+        generator=reference_generator,
+    )
+
+    torch.testing.assert_close(samples, reference_samples, rtol=0, atol=0)
+    assert samples[1].item() == probs[1].argmax().item()
+
+
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize("p", [0.05, 0.1, 0.2, 0.7, 1])

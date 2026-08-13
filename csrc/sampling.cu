@@ -201,7 +201,7 @@ void top_k_sampling_from_probs(TensorView probs, TensorView output,
         static_cast<float*>(probs.data_ptr()), static_cast<IdType*>(output.data_ptr()),
         maybe_indices.has_value() ? static_cast<IdType*>(maybe_indices.value().data_ptr())
                                   : nullptr,
-        has_top_k_arr ? static_cast<float*>(maybe_top_k_arr.value().data_ptr()) : nullptr,
+        has_top_k_arr ? static_cast<IdType*>(maybe_top_k_arr.value().data_ptr()) : nullptr,
         batch_size, top_k_val, vocab_size, deterministic,
         maybe_seed_arr.has_value() ? static_cast<uint64_t*>(maybe_seed_arr.value().data_ptr())
                                    : nullptr,
