@@ -856,7 +856,7 @@ template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           typename DType, typename IdType>
 __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void TopKSamplingFromProbKernel(
     DType* probs, IdType* output, bool* valid, IdType* indices, IdType* top_k_arr,
-    uint32_t top_k_val, uint32_t d, uint64_t* seed_arr, uint64_t seed_val, uint64_t* offset_arr,
+    IdType top_k_val, uint32_t d, uint64_t* seed_arr, uint64_t seed_val, uint64_t* offset_arr,
     uint64_t offset_val) {
   const uint32_t batch_size = gridDim.x;
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
@@ -867,7 +867,9 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void TopKSamplingFro
 
   curandStatePhilox4_32_10_t state;
   curand_init(philox_seed, bx, philox_offset, &state);
-  const uint32_t k = top_k_arr == nullptr ? top_k_val : top_k_arr[bx];
+  const IdType raw_k = top_k_arr == nullptr ? top_k_val : top_k_arr[bx];
+  const uint32_t k =
+      raw_k <= 0 || raw_k > static_cast<IdType>(d) ? d : static_cast<uint32_t>(raw_k);
   const uint32_t row_idx = indices == nullptr ? bx : indices[bx];
 
   extern __shared__ __align__(
@@ -1221,7 +1223,9 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void TopKTopPSamplin
   curandStatePhilox4_32_10_t state;
   curand_init(philox_seed, bx, philox_offset, &state);
   const uint32_t row_idx = indices == nullptr ? bx : indices[bx];
-  const uint32_t k = top_k_arr == nullptr ? top_k_val : top_k_arr[row_idx];
+  const IdType raw_k = top_k_arr == nullptr ? top_k_val : top_k_arr[row_idx];
+  const uint32_t k =
+      raw_k <= 0 || raw_k > static_cast<IdType>(d) ? d : static_cast<uint32_t>(raw_k);
   const float p = top_p_arr == nullptr ? top_p_val : top_p_arr[row_idx];
 
   extern __shared__ __align__(
@@ -1534,7 +1538,8 @@ cudaError_t SamplingFromProb(T* probs, IdType* output, bool* valid, IdType* indi
 
 template <typename T, typename IdType>
 cudaError_t TopKSamplingFromProb(T* probs, IdType* output, bool* valid, IdType* indices,
-                                 T* top_k_arr, uint32_t batch_size, uint32_t top_k_val, uint32_t d,
+                                 IdType* top_k_arr, uint32_t batch_size, IdType top_k_val,
+                                 uint32_t d,
                                  bool deterministic, uint64_t* seed_arr, uint64_t seed_val,
                                  uint64_t* offset_arr, uint64_t offset_val,
                                  cudaStream_t stream = 0) {
