@@ -423,10 +423,60 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void OnlineSoftmaxFu
 #endif
 }
 
-template <uint32_t BLOCK_THREADS, uint32_t VEC_SIZE, typename DType>
-__global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void OnlineSoftmaxMapKernel(
+// Map processors run on every thread in the block. Transform scales logits in place
+// and returns a block-wide maximum. Store reduces the per-thread denominator and
+// writes the slice result. A processor may keep additional per-thread state.
+struct DefaultSoftmaxMapProcessor {
+  template <uint32_t BLOCK_THREADS, uint32_t VEC_SIZE, typename DType>
+  __device__ __forceinline__ float Transform(vec_t<DType, VEC_SIZE>& logits_vec, float inv_temp,
+                                             OnlineSoftmaxTempStorage<BLOCK_THREADS>& temp_storage,
+                                             uint32_t, uint32_t) {
+    const uint32_t tx = threadIdx.x;
+    float thread_max = -cuda::std::numeric_limits<float>::infinity();
+#pragma unroll
+    for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+      // __fmul_rn, not *: it must not be contracted into an FMA.
+      // *= inv_temp can lead to probabilities exceeding 1 at low temperatures (see PR #5088).
+      logits_vec[j] = __fmul_rn(static_cast<float>(logits_vec[j]), inv_temp);
+      thread_max = max(thread_max, logits_vec[j]);
+    }
+
+    float block_max = cub::BlockReduce<float, BLOCK_THREADS>(temp_storage.block_prim.reduce)
+                          .Reduce(thread_max, MaxReduceOp{});
+
+    if (tx == 0) {
+      temp_storage.shared_state.max_val = block_max;
+    }
+    __syncthreads();
+    block_max = temp_storage.shared_state.max_val;
+
+    return block_max;
+  }
+
+  template <uint32_t BLOCK_THREADS>
+  __device__ __forceinline__ void Store(PartialSoftmaxResult* partial_results, uint32_t num_slices,
+                                        float running_max, float threadlocal_running_denominator,
+                                        OnlineSoftmaxTempStorage<BLOCK_THREADS>& temp_storage) {
+    const uint32_t bx = blockIdx.x, by = blockIdx.y, tx = threadIdx.x;
+    float running_denominator;
+    running_denominator = cub::BlockReduce<float, BLOCK_THREADS>(temp_storage.block_prim.reduce)
+                              .Sum(threadlocal_running_denominator);
+    if (tx == 0) {
+      temp_storage.shared_state.denominator = running_denominator;
+    }
+    __syncthreads();
+    running_denominator = temp_storage.shared_state.denominator;
+
+    if (tx == 0) {
+      partial_results[bx * num_slices + by] = {running_max, running_denominator};
+    }
+  }
+};
+
+template <uint32_t BLOCK_THREADS, uint32_t VEC_SIZE, typename DType, typename Processor>
+__device__ __forceinline__ void OnlineSoftmaxMapWithProcessor(
     DType* logits, PartialSoftmaxResult* partial_results, DType* temperature_arr,
-    float temperature_val, uint32_t d, uint32_t num_slices) {
+    float temperature_val, uint32_t d, uint32_t num_slices, Processor processor) {
   const uint32_t bx = blockIdx.x;
   const uint32_t by = blockIdx.y;  // slice index
   const uint32_t tx = threadIdx.x;
@@ -446,7 +496,6 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void OnlineSoftmaxMa
 
   vec_t<DType, VEC_SIZE> logits_vec;
   float running_max = -cuda::std::numeric_limits<float>::infinity();
-  float running_denominator = 0.0f;
   float threadlocal_running_denominator = 0.0f;
 
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
@@ -461,24 +510,9 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void OnlineSoftmaxMa
       logits_vec.cast_load(logits + bx * d + slice_start + (i * BLOCK_THREADS + tx) * VEC_SIZE);
     }
 
-    float thread_max = -cuda::std::numeric_limits<float>::infinity();
-#pragma unroll
-    for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-      // __fmul_rn, not *: it must not be contracted into an FMA.
-      // *= inv_temp can lead to probabilities exceeding 1 at low temperatures (see PR #5088).
-      logits_vec[j] = __fmul_rn(static_cast<float>(logits_vec[j]), inv_temp);
-      thread_max = max(thread_max, logits_vec[j]);
-    }
-
-    float block_max = cub::BlockReduce<float, BLOCK_THREADS>(temp_storage.block_prim.reduce)
-                          .Reduce(thread_max, MaxReduceOp{});
-
-    if (tx == 0) {
-      temp_storage.shared_state.max_val = block_max;
-    }
-    __syncthreads();
-    block_max = temp_storage.shared_state.max_val;
-
+    float block_max = processor.template Transform<BLOCK_THREADS, VEC_SIZE>(
+        logits_vec, inv_temp, temp_storage, slice_start + (i * BLOCK_THREADS + tx) * VEC_SIZE,
+        slice_start + slice_size);
     // if block_max is -inf, then this block contains all -inf values, so we can skip updating
     if (!isinf(block_max)) {
       float threadlocal_sum = 0.0f;
@@ -494,26 +528,33 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void OnlineSoftmaxMa
     }
   }
 
-  running_denominator = cub::BlockReduce<float, BLOCK_THREADS>(temp_storage.block_prim.reduce)
-                            .Sum(threadlocal_running_denominator);
-  if (tx == 0) {
-    temp_storage.shared_state.denominator = running_denominator;
-  }
-  __syncthreads();
-  running_denominator = temp_storage.shared_state.denominator;
-
-  if (tx == 0) {
-    partial_results[bx * num_slices + by] = {running_max, running_denominator};
-  }
+  processor.template Store<BLOCK_THREADS>(partial_results, num_slices, running_max,
+                                          threadlocal_running_denominator, temp_storage);
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   asm volatile("griddepcontrol.launch_dependents;");
 #endif
 }
 
 template <uint32_t BLOCK_THREADS, uint32_t VEC_SIZE, typename DType>
-__global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void OnlineSoftmaxReduceKernel(
-    DType* logits, DType* output, PartialSoftmaxResult* partial_results, DType* temperature_arr,
+__global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void OnlineSoftmaxMapKernel(
+    DType* logits, PartialSoftmaxResult* partial_results, DType* temperature_arr,
     float temperature_val, uint32_t d, uint32_t num_slices) {
+  OnlineSoftmaxMapWithProcessor<BLOCK_THREADS, VEC_SIZE>(logits, partial_results, temperature_arr,
+                                                         temperature_val, d, num_slices,
+                                                         DefaultSoftmaxMapProcessor{});
+}
+
+// The reduction epilogue runs on every thread after the probability writes.
+// Synchronize before reusing the block's temporary storage.
+struct NoOpSoftmaxEpilogue {
+  template <uint32_t BLOCK_THREADS>
+  __device__ __forceinline__ void Run(OnlineSoftmaxTempStorage<BLOCK_THREADS>&) {}
+};
+
+template <uint32_t BLOCK_THREADS, uint32_t VEC_SIZE, typename DType, typename Epilogue>
+__device__ __forceinline__ void OnlineSoftmaxReduceWithEpilogue(
+    DType* logits, DType* output, PartialSoftmaxResult* partial_results, DType* temperature_arr,
+    float temperature_val, uint32_t d, uint32_t num_slices, Epilogue epilogue) {
   const uint32_t bx = blockIdx.x;
   const uint32_t tx = threadIdx.x;
   float temperature = temperature_arr == nullptr ? temperature_val : temperature_arr[bx];
@@ -577,9 +618,20 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void OnlineSoftmaxRe
       prob_vec.cast_store(output + bx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE);
     }
   }
+  epilogue.template Run<BLOCK_THREADS>(temp_storage);
+
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   asm volatile("griddepcontrol.launch_dependents;");
 #endif
+}
+
+template <uint32_t BLOCK_THREADS, uint32_t VEC_SIZE, typename DType>
+__global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void OnlineSoftmaxReduceKernel(
+    DType* logits, DType* output, PartialSoftmaxResult* partial_results, DType* temperature_arr,
+    float temperature_val, uint32_t d, uint32_t num_slices) {
+  OnlineSoftmaxReduceWithEpilogue<BLOCK_THREADS, VEC_SIZE>(logits, output, partial_results,
+                                                           temperature_arr, temperature_val, d,
+                                                           num_slices, NoOpSoftmaxEpilogue{});
 }
 
 template <uint32_t VEC_SIZE, uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
@@ -855,9 +907,8 @@ template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, bool DETERMINISTIC,
           typename DType, typename IdType>
 __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void TopKSamplingFromProbKernel(
-    DType* probs, IdType* output, bool* valid, IdType* indices, IdType* top_k_arr,
-    IdType top_k_val, uint32_t d, uint64_t* seed_arr, uint64_t seed_val, uint64_t* offset_arr,
-    uint64_t offset_val) {
+    DType* probs, IdType* output, bool* valid, IdType* indices, IdType* top_k_arr, IdType top_k_val,
+    uint32_t d, uint64_t* seed_arr, uint64_t seed_val, uint64_t* offset_arr, uint64_t offset_val) {
   const uint32_t batch_size = gridDim.x;
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
 
@@ -1206,13 +1257,22 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void MinPSamplingFro
   valid[bx] = true;
 }
 
+// Called only by thread zero, including the invalid-probability fallback.
+// Return the final token ID; the epilogue can also emit a score for that token.
+struct IdentitySamplingEpilogue {
+  template <typename IdType>
+  __device__ __forceinline__ IdType operator()(uint32_t, uint32_t, IdType token) {
+    return token;
+  }
+};
+
 template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, bool DETERMINISTIC,
-          typename DType, typename IdType>
-__global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void TopKTopPSamplingFromProbKernel(
+          typename DType, typename IdType, typename Epilogue>
+__device__ __forceinline__ void TopKTopPSamplingFromProbWithEpilogue(
     DType* probs, IdType* top_k_arr, float* top_p_arr, IdType* output, bool* valid, IdType* indices,
     IdType top_k_val, float top_p_val, uint32_t d, uint64_t* seed_arr, uint64_t seed_val,
-    uint64_t* offset_arr, uint64_t offset_val) {
+    uint64_t* offset_arr, uint64_t offset_val, Epilogue epilogue) {
   const uint32_t batch_size = gridDim.x;
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
 
@@ -1269,7 +1329,7 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void TopKTopPSamplin
       sampled_id = temp_storage.last_valid_id;
       if (temp_storage.last_valid_id == -1) {
         if (tx == 0) {
-          output[bx] = 0;
+          output[bx] = epilogue(bx, row_idx, IdType(0));
           valid[bx] = false;
         }
         return;
@@ -1336,9 +1396,22 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void TopKTopPSamplin
   } while (low < high);
   __syncthreads();
   if (tx == 0) {
-    output[bx] = sampled_id;
+    output[bx] = epilogue(bx, row_idx, IdType(sampled_id));
     valid[bx] = true;
   }
+}
+
+template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
+          BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, bool DETERMINISTIC,
+          typename DType, typename IdType>
+__global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void TopKTopPSamplingFromProbKernel(
+    DType* probs, IdType* top_k_arr, float* top_p_arr, IdType* output, bool* valid, IdType* indices,
+    IdType top_k_val, float top_p_val, uint32_t d, uint64_t* seed_arr, uint64_t seed_val,
+    uint64_t* offset_arr, uint64_t offset_val) {
+  TopKTopPSamplingFromProbWithEpilogue<BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM, VEC_SIZE,
+                                       DETERMINISTIC>(
+      probs, top_k_arr, top_p_arr, output, valid, indices, top_k_val, top_p_val, d, seed_arr,
+      seed_val, offset_arr, offset_val, IdentitySamplingEpilogue{});
 }
 
 template <typename DType>
@@ -1539,9 +1612,8 @@ cudaError_t SamplingFromProb(T* probs, IdType* output, bool* valid, IdType* indi
 template <typename T, typename IdType>
 cudaError_t TopKSamplingFromProb(T* probs, IdType* output, bool* valid, IdType* indices,
                                  IdType* top_k_arr, uint32_t batch_size, IdType top_k_val,
-                                 uint32_t d,
-                                 bool deterministic, uint64_t* seed_arr, uint64_t seed_val,
-                                 uint64_t* offset_arr, uint64_t offset_val,
+                                 uint32_t d, bool deterministic, uint64_t* seed_arr,
+                                 uint64_t seed_val, uint64_t* offset_arr, uint64_t offset_val,
                                  cudaStream_t stream = 0) {
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
 
