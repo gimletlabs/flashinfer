@@ -28,15 +28,14 @@
 #define SMEM_SOUTPUT_STRIDE 256
 #define SMEM_TOTAL 9088
 #define THREADS 128
-// Gimlet: the kernel indexes heads only through H and HV, so a build may set both with
-// CAKE_GDN_DECODE_H and CAKE_GDN_DECODE_HV to serve other head counts. Unset, they keep this
-// variant's 16/32 specialization.
-#if defined(CAKE_GDN_DECODE_H) != defined(CAKE_GDN_DECODE_HV)
-#error "set both CAKE_GDN_DECODE_H and CAKE_GDN_DECODE_HV, or neither"
+// Gimlet: the kernel indexes heads only through H and HV, so a build may set both with CAKE_GDN_H
+// and CAKE_GDN_HV to serve other head counts. Unset, they keep this variant's 16/32 specialization.
+#if defined(CAKE_GDN_H) != defined(CAKE_GDN_HV)
+#error "set both CAKE_GDN_H and CAKE_GDN_HV, or neither"
 #endif
-#ifdef CAKE_GDN_DECODE_H
-#define H CAKE_GDN_DECODE_H
-#define HV CAKE_GDN_DECODE_HV
+#ifdef CAKE_GDN_H
+#define H CAKE_GDN_H
+#define HV CAKE_GDN_HV
 #else
 #define H 16
 #define HV 32
