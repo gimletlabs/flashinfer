@@ -425,6 +425,20 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void OnlineSoftmaxFu
 #endif
 }
 
+// An optional hook may resolve a row without probabilities. The map, reduce, and
+// sample hooks must agree for each input row and every thread in its block. Such
+// rows do not populate softmax or observer buffers. The sampling epilogue must
+// return the resolved token without reading probabilities or the candidate ID.
+template <typename Hook>
+__device__ __forceinline__ auto SkipResolvedRow(const Hook& hook, uint32_t row, int)
+    -> decltype(hook.SkipResolvedRow(row)) {
+  return hook.SkipResolvedRow(row);
+}
+template <typename Hook>
+__device__ __forceinline__ bool SkipResolvedRow(const Hook&, uint32_t, long) {
+  return false;
+}
+
 // Map observers see unscaled logits without modifying the sampling calculation.
 // Init runs after the PDL wait; Observe and Finish run on every thread in a nonempty slice.
 // None of these hooks runs for a slice that starts past d.
@@ -466,6 +480,7 @@ __device__ __forceinline__ void OnlineSoftmaxMapWithObserver(
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   asm volatile("griddepcontrol.wait;" ::: "memory");
 #endif
+  if (SkipResolvedRow(observer, bx, 0)) return;
   float temperature = temperature_arr == nullptr ? temperature_val : temperature_arr[bx];
   const float inv_temp = (temperature == 0.f) ? 0.f : 1.f / temperature;
 
@@ -567,6 +582,7 @@ __device__ __forceinline__ void OnlineSoftmaxReduceWithEpilogue(
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   asm volatile("griddepcontrol.wait;" ::: "memory");
 #endif
+  if (SkipResolvedRow(epilogue, bx, 0)) return;
   float temperature = temperature_arr == nullptr ? temperature_val : temperature_arr[bx];
   const float inv_temp = (temperature == 0.f) ? 0.f : 1.f / temperature;
 
@@ -1272,13 +1288,20 @@ __device__ __forceinline__ void TopKTopPSamplingFromProbWithEpilogue(
   const uint32_t batch_size = gridDim.x;
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
 
+  const uint32_t row_idx = indices == nullptr ? bx : indices[bx];
+  if (SkipResolvedRow(epilogue, row_idx, 0)) {
+    if (tx == 0) {
+      output[bx] = epilogue(bx, row_idx, IdType(0));
+      valid[bx] = true;
+    }
+    return;
+  }
   // Resolve seed/offset from tensor or scalar
   uint64_t philox_seed = seed_arr ? seed_arr[bx] : seed_val;
   uint64_t philox_offset = offset_arr ? offset_arr[bx] : offset_val;
 
   curandStatePhilox4_32_10_t state;
   curand_init(philox_seed, bx, philox_offset, &state);
-  const uint32_t row_idx = indices == nullptr ? bx : indices[bx];
   const IdType raw_k = top_k_arr == nullptr ? top_k_val : top_k_arr[row_idx];
   const uint32_t k =
       raw_k <= 0 || raw_k > static_cast<IdType>(d) ? d : static_cast<uint32_t>(raw_k);
